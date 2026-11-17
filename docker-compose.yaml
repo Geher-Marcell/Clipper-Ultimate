@@ -1,0 +1,26 @@
+services:
+    live-clipper:
+        build: .
+        container_name: my-live-clipper
+        restart: unless-stopped
+        security_opt:
+            - no-new-privileges:true
+        environment:
+            - STREAM_URLS=https://www.twitch.tv/dantes
+            - SCORE_THRESHOLD=65
+            - WHISPER_MODEL=base.en
+            - TITLE_MODEL=Qwen/Qwen2.5-1.5B-Instruct
+            - BURN_SUBTITLES=true
+        volumes:
+            - ./data/clips:/app/data/clips
+            # Cache HuggingFace models on host so container rebuilds don't re-download them
+            - ./data/hf_cache:/root/.cache/huggingface
+        tmpfs:
+            - /app/data/buffer:size=2G
+        deploy:
+            resources:
+                reservations:
+                    devices:
+                        - driver: nvidia
+                          count: 1
+                          capabilities: [gpu]
