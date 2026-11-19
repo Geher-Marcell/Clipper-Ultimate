@@ -6,15 +6,23 @@ services:
         security_opt:
             - no-new-privileges:true
         environment:
-            - STREAM_URLS=https://www.twitch.tv/dantes
+            - STREAM_URLS=https://www.twitch.tv/typicalgamer,https://www.twitch.tv/ishowspeed,https://www.twitch.tv/kaicenat,https://www.twitch.tv/ohnepixel,https://www.twitch.tv/xqc,https://www.twitch.tv/nickeh30
             - SCORE_THRESHOLD=65
             - WHISPER_MODEL=base.en
-            - TITLE_MODEL=Qwen/Qwen2.5-1.5B-Instruct
+            - CLIP_PRE_SECONDS=30
+            - CLIP_POST_SECONDS=10
             - BURN_SUBTITLES=true
+            # Auto-Upload Settings
+            - ENABLE_UPLOAD=false
+            - UPLOAD_TIKTOK=true
+            - UPLOAD_YOUTUBE=true
+            - UPLOAD_INSTAGRAM=true
+            - MIN_UPLOAD_INTERVAL_SEC=1800
+            - IG_USERNAME=
+            - IG_PASSWORD=
         volumes:
             - ./data/clips:/app/data/clips
-            # Cache HuggingFace models on host so container rebuilds don't re-download them
-            - ./data/hf_cache:/root/.cache/huggingface
+            - ./data/auth:/app/data/auth
         tmpfs:
             - /app/data/buffer:size=2G
         deploy:

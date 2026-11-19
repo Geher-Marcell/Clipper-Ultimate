@@ -1,4 +1,4 @@
-from collections import deque
+from collections import Counter, deque
 import json
 import os
 import re
@@ -9,9 +9,9 @@ import subprocess
 import textwrap
 import threading
 import time
+import cv2
 from faster_whisper import WhisperModel
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from uploader import UploadManager, build_social_metadata
 
 # --- Configuration ---
 STREAM_URLS = [
@@ -23,10 +23,8 @@ STREAM_URLS = [
     if u.strip()
 ]
 WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "base.en")
-TITLE_MODEL_NAME = os.getenv("TITLE_MODEL", "Qwen/Qwen2.5-1.5B-Instruct")
 BURN_SUBTITLES = os.getenv("BURN_SUBTITLES", "true").lower() == "true"
 
-# Auto-Tuner & Clip Timing Settings (30s total clip: 30s pre, 0s post)
 INITIAL_THRESHOLD = float(os.getenv("SCORE_THRESHOLD", "65"))
 MIN_THRESHOLD = 52.0
 MAX_THRESHOLD = 88.0
@@ -36,13 +34,12 @@ BASE_BUFFER_DIR = "/app/data/buffer"
 CLIPS_DIR = "/app/data/clips"
 FONT_PATH = "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
 
-SEGMENT_TIME = 4  # 4-second HLS chunks
-BUFFER_SEGMENTS = 25  # 25 * 4s = 100s rolling buffer in RAM
-CLIP_PRE_SECONDS = 30  # Reduced by 60s (90s -> 30s)
-CLIP_POST_SECONDS = 0  # Reduced by 30s (30s -> 0s)
-COOLDOWN_SECONDS = 45  # Prevent overlapping 30-second clips
+SEGMENT_TIME = 4
+BUFFER_SEGMENTS = 25
+CLIP_PRE_SECONDS = int(os.getenv("CLIP_PRE_SECONDS", "30"))
+CLIP_POST_SECONDS = int(os.getenv("CLIP_POST_SECONDS", "0"))
+COOLDOWN_SECONDS = 45
 
-# Modern Livestream Slang + GTA 6 Chat Triggers
 CHAT_HYPE_PATTERN = re.compile(
     r"(?:"
     r"\b(?:cooked|cinema|cinematic|ts|pmo|sybau|icl|ong|fr+|nah+|bro+|aura|unc|glaz(?:e|ing)|"
@@ -52,201 +49,422 @@ CHAT_HYPE_PATTERN = re.compile(
     r"\b(?:ain'?t\s+no\s+way|no\s+way|hell\s+nah|we\s+are\s+so\s+back|it'?s\s+over|"
     r"chat\s+is\s+this\s+real|absolute\s+cinema|what\s+the\s+helly?)\b"
     r"|"
-    r"\b(?:gta\s*(?:6|vi)|rockstar|r\*|lucia|jason|leonida|vice\s*city|trailer\s*[23]?|"
-    r"delay(?:ed)?|before\s+gta\s*(?:6|vi)|goty|60\s*fps|30\s*fps|leak(?:s|ed)?)\b"
+    r"\b(?:gta\s*(?:6|vi)|gtavi|vice\s*city|leonida|goty)\b"
     r"|"
     r"\?{3,}|!{3,}|7{3,}"
     r")",
     re.IGNORECASE,
 )
 
-# Spoken Streamer Triggers (Whisper Transcription)
 SPEECH_HYPE_PATTERN = re.compile(
     r"(?:"
     r"\b(?:clip\s+(?:that|it)|absolute\s+cinema|we(?:'re|\s+are)\s+cooked|we\s+are\s+so\s+back|"
     r"ain'?t\s+no\s+way|no\s+way|no\s+shot|chat\s+is\s+this\s+real|what\s+just\s+happened|"
     r"oh\s+my\s+god|let'?s\s+go|are\s+you\s+(?:kidding|serious)|holy\s+shit|bro\s+what|"
     r"what\s+the\s+(?:hell|fuck)|insane|crazy)\b"
-    r"|"
-    r"\b(?:gta\s*(?:6|six|vi)|rockstar|lucia|jason|vice\s*city|leonida|"
-    r"before\s+gta\s*(?:6|six)|game\s+of\s+the\s+year|delayed)\b"
     r")",
     re.IGNORECASE,
 )
+
+EMOTES_AND_FILLER = {
+    "the", "and", "that", "this", "what", "with", "for", "you", "are", "bro",
+    "nah", "omg", "wtf", "lol", "lmao", "kekw", "lul", "lulw", "omegalul",
+    "pog", "poggers", "icant", "aware", "yes", "not", "can", "just", "like",
+    "chat", "stream", "clip", "clipped", "his", "her", "they", "them", "was",
+    "were", "have", "had", "out", "get", "got", "how", "why", "who", "when",
+    "yeah", "yep", "nope", "wait", "look", "man", "dude", "guys", "actually",
+    "literally", "really", "very", "here", "there", "going", "gonna", "wanna",
+}
+
+HOOK_BOOST_WORDS = {
+    "way", "shot", "what", "how", "why", "cooked", "cinema", "insane", "crazy",
+    "dead", "died", "kill", "killed", "clutch", "penta", "pentakill", "quadra",
+    "heist", "cops", "police", "wasted", "busted", "holy", "god", "real",
+    "happened", "stop", "impossible", "bro", "survived", "missed", "stolen",
+}
+
+STOPWORDS = {
+    "the",
+    "and",
+    "that",
+    "this",
+    "what",
+    "with",
+    "for",
+    "you",
+    "are",
+    "bro",
+    "nah",
+    "omg",
+    "wtf",
+    "lol",
+    "lmao",
+    "kekw",
+    "lul",
+    "lulw",
+    "omegalul",
+    "pog",
+    "poggers",
+    "icant",
+    "aware",
+    "yes",
+    "not",
+    "can",
+    "just",
+    "like",
+}
 
 os.makedirs(BASE_BUFFER_DIR, exist_ok=True)
 os.makedirs(CLIPS_DIR, exist_ok=True)
 
 print(
-    f"[INIT] Loading shared Faster-Whisper ({WHISPER_MODEL_NAME}) on CUDA for"
+    f"[INIT] Loading Faster-Whisper ({WHISPER_MODEL_NAME}) on CUDA for"
     f" {len(STREAM_URLS)} streams..."
 )
 whisper_model = WhisperModel(
     WHISPER_MODEL_NAME, device="cuda", compute_type="float16"
 )
+gpu_lock = threading.Lock()
+uploader = UploadManager()
 
-print(f"[INIT] Loading local title model ({TITLE_MODEL_NAME}) on CUDA...")
-title_tokenizer = AutoTokenizer.from_pretrained(TITLE_MODEL_NAME)
-title_model = AutoModelForCausalLM.from_pretrained(
-    TITLE_MODEL_NAME,
-    torch_dtype=torch.float16,
-    device_map="cuda",
+_cascade_cls = getattr(cv2, "CascadeClassifier", None)
+FACE_CASCADE = (
+    _cascade_cls(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    if _cascade_cls and hasattr(cv2, "data")
+    else None
 )
 
-gpu_lock = threading.Lock()
+
+def get_sorted_segments(directory):
+  """Safely lists and sorts .ts segments by mtime without crashing on concurrent deletion."""
+  if not os.path.exists(directory):
+    return []
+  items = []
+  for fname in os.listdir(directory):
+    if not fname.endswith(".ts"):
+      continue
+    fpath = os.path.join(directory, fname)
+    try:
+      items.append((os.path.getmtime(fpath), fpath))
+    except FileNotFoundError:
+      continue
+  items.sort(key=lambda x: x[0])
+  return [fpath for _, fpath in items]
 
 
-def format_srt_timestamp(seconds):
+def format_ass_timestamp(seconds):
   hrs = int(seconds // 3600)
   mins = int((seconds % 3600) // 60)
   secs = int(seconds % 60)
-  millis = int((seconds - int(seconds)) * 1000)
-  return f"{hrs:02d}:{mins:02d}:{secs:02d},{millis:03d}"
+  centis = int(round((seconds - int(seconds)) * 100))
+  if centis >= 100:
+    secs += 1
+    centis = 0
+  return f"{hrs}:{mins:02d}:{secs:02d}.{centis:02d}"
 
 
-def transcribe_full_clip(mp4_path, srt_path):
-  """Transcribes the saved clip on GPU, writes an .srt file, and returns full text."""
+def escape_ass_text(text):
+  return text.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
+
+
+def transcribe_and_build_punchy_ass(mp4_path, ass_path, has_webcam=False):
+  """Transcribes with word timestamps on GPU and builds a kinetic CapCut-style .ass file."""
+  words = []
   full_lines = []
-  srt_blocks = []
+
   with gpu_lock:
     segments, _ = whisper_model.transcribe(
-        mp4_path,
-        beam_size=2,
-        vad_filter=True,
-        word_timestamps=False,
+        mp4_path, beam_size=2, vad_filter=True, word_timestamps=True
     )
-    for idx, seg in enumerate(segments, start=1):
-      text = seg.text.strip()
-      if not text:
-        continue
-      full_lines.append(text)
-      start_ts = format_srt_timestamp(seg.start)
-      end_ts = format_srt_timestamp(seg.end)
-      srt_blocks.append(f"{idx}\n{start_ts} --> {end_ts}\n{text}\n")
+    for seg in segments:
+      seg_text = seg.text.strip()
+      if seg_text:
+        full_lines.append(seg_text)
+      if seg.words:
+        for w in seg.words:
+          clean_w = w.word.strip()
+          if clean_w:
+            words.append({
+                "word": clean_w.upper(),
+                "start": float(w.start),
+                "end": float(w.end),
+            })
 
-  with open(srt_path, "w", encoding="utf-8") as f:
-    f.write("\n".join(srt_blocks))
+  chunks, current_chunk = [], []
+  for w in words:
+    current_chunk.append(w)
+    duration = current_chunk[-1]["end"] - current_chunk[0]["start"]
+    if (
+        len(current_chunk) >= 3
+        or duration >= 1.35
+        or w["word"].endswith((".", "!", "?"))
+    ):
+      chunks.append(current_chunk)
+      current_chunk = []
+  if current_chunk:
+    chunks.append(current_chunk)
+
+  margin_v = 630 if has_webcam else 470
+  ass_header = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1920
+WrapStyle: 2
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Punchy,Liberation Sans,76,&H00FFFFFF,&H0000FFFF,&H00000000,&H99000000,-1,0,0,0,100,100,1.5,0,1,6,3,2,60,60,{margin_v},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+
+  events = []
+  for chunk in chunks:
+    for active_idx, active_word in enumerate(chunk):
+      w_start = active_word["start"]
+      w_end = (
+          max(w_start + 0.08, chunk[active_idx + 1]["start"])
+          if active_idx + 1 < len(chunk)
+          else max(w_start + 0.12, active_word["end"])
+      )
+      if w_end <= 2.6:
+        continue
+      w_start = max(w_start, 2.6)
+
+      styled_words = [
+          (
+              r"{\c&H0000FFFF&\fscx114\fscy114\t(0,90,\fscx104\fscy104)}"
+              + escape_ass_text(w["word"])
+              + r"{\r}"
+              if i == active_idx
+              else escape_ass_text(w["word"])
+          )
+          for i, w in enumerate(chunk)
+      ]
+      events.append(
+          f"Dialogue: 0,{format_ass_timestamp(w_start)},{format_ass_timestamp(w_end)},Punchy,,0,0,0,,{' '.join(styled_words)}"
+      )
+
+  with open(ass_path, "w", encoding="utf-8") as f:
+    f.write(ass_header + "\n".join(events) + "\n")
 
   return " ".join(full_lines)
 
 
-def generate_hook_title(channel, transcript, sample_chat_msgs):
-  """Generates a 4-7 word factual hook title locally on GPU with zero API keys."""
-  clean_channel = channel.replace("_", " ").title()
-  messages = [
-      {
-          "role": "system",
-          "content": (
-              "You write short, punchy 4 to 7 word stream clip titles"
-              " describing what happened (e.g., 'Velja gets insane 1v3"
-              " clutch' or 'Streamer reacts to GTA 6 trailer'). Output ONLY"
-              " the title text. No quotes, no hashtags, no emojis."
-          ),
-      },
-      {
-          "role": "user",
-          "content": (
-              f"Streamer: {clean_channel}\n"
-              f"Transcript: {transcript[-1000:]}\n"
-              f"Chat reactions: {', '.join(sample_chat_msgs[:15])}"
-          ),
-      },
-  ]
+def generate_dynamic_title(channel, transcript, sample_chat_msgs):
+    """Dynamically builds a punchy title from the streamer's best spoken quote
+    or synthesizes a topic + chat-sentiment hook without any external AI/LLM.
+    """
+    clean_channel = channel.replace("_", " ").title()
+    chat_text = " ".join(sample_chat_msgs)
+    chat_low = chat_text.lower()
 
-  try:
-    with gpu_lock:
-      text_input = title_tokenizer.apply_chat_template(
-          messages, tokenize=False, add_generation_prompt=True
-      )
-      inputs = title_tokenizer([text_input], return_tensors="pt").to("cuda")
-      with torch.no_grad():
-        output_ids = title_model.generate(
-            **inputs,
-            max_new_tokens=24,
-            do_sample=True,
-            temperature=0.4,
-            pad_token_id=title_tokenizer.eos_token_id,
-        )
-      generated = output_ids[0][inputs.input_ids.shape[1] :]
-      title = (
-          title_tokenizer.decode(generated, skip_special_tokens=True)
-          .strip()
-          .strip("\"'")
-      )
-      if 3 <= len(title) <= 65:
-        return title
-  except Exception as e:
-    print(f"[{channel}][LOCAL-TITLE] Error ({e}), using fallback.")
+    # Extract meaningful keywords from chat to weight matching spoken phrases
+    chat_tokens = [
+        t for t in re.findall(r"\b[a-zA-Z0-9]{3,15}\b", chat_low)
+        if t not in EMOTES_AND_FILLER
+    ]
+    chat_counts = Counter(chat_tokens)
 
-  combined = f"{transcript} {' '.join(sample_chat_msgs)}".lower()
-  if re.search(r"gta\s*(6|vi)|rockstar|lucia|jason|vice city", combined):
-    return f"{clean_channel} reacts to GTA 6"
-  if re.search(r"pentakill|quadra|triple|1v\d|outplay|clutch|insane", combined):
-    return f"{clean_channel} pulls off insane play"
-  if re.search(r"cooked|fail|int|died|throw|no way", combined):
-    return f"{clean_channel} gets completely cooked"
-  return f"{clean_channel} goes crazy on stream"
+    # --- Strategy 1: Mine the sharpest 3-7 word spoken quote from Whisper ---
+    best_quote = ""
+    best_score = 0.0
+
+    if transcript:
+        # Split on sentence boundaries and strong pauses
+        raw_clauses = re.split(r"[.!?\n]+|,\s+(?=(?:what|how|why|no|bro|wait|oh|are|did)\b)", transcript)
+        for clause in raw_clauses:
+            cleaned = re.sub(r"\s+", " ", clause).strip(" .,!?;:\"'()-")
+            words = cleaned.split()
+            if len(words) < 3:
+                continue
+
+            # Trim overly long sentences down to a crisp 6-word hook so it fits 9:16 intro cleanly
+            if len(words) > 7:
+                words = words[:6]
+                cleaned = " ".join(words)
+
+            if len(cleaned) > 40:
+                continue
+
+            score = 1.0
+            lower_words = [w.lower().strip(".,!?\"'") for w in words]
+
+            # Boost clauses containing high-emotion trigger words
+            score += sum(1.5 for w in lower_words if w in HOOK_BOOST_WORDS)
+            # Boost if the streamer said a word that Twitch chat was also spamming
+            score += sum(min(3.0, chat_counts[w] * 0.6) for w in lower_words if w in chat_counts)
+            # Sweet-spot length bonus (4 to 6 words)
+            if 4 <= len(words) <= 6:
+                score += 1.5
+
+            if score > best_score:
+                best_score = score
+                best_quote = cleaned
+
+    if best_quote and best_score >= 3.0:
+        # Capitalize first letter cleanly
+        formatted_quote = best_quote[0].upper() + best_quote[1:]
+        if not formatted_quote.endswith(("!", "?")):
+            formatted_quote += "!"
+        return f'"{formatted_quote}"'
+
+    # --- Strategy 2: Synthesize Topic + Chat Sentiment when speech is non-verbal ---
+    transcript_tokens = [
+        t for t in re.findall(r"\b[a-zA-Z0-9]{3,15}\b", transcript.lower())
+        if t not in EMOTES_AND_FILLER
+    ]
+    combined_counts = chat_counts + Counter(transcript_tokens)
+
+    # Detect dominant chat mood
+    if re.search(r"\b(?:kekw|omegalul|icant|lmao|lulw?|haha)\b", chat_low):
+        mood = "laugh"
+    elif re.search(r"\b(?:wtf|no\s+way|aware|cooked|pause|joever)\b|\?{3,}", chat_low):
+        mood = "shock"
+    else:
+        mood = "hype"
+
+    if combined_counts:
+        top_topic, freq = combined_counts.most_common(1)[0]
+        if freq >= 2:
+            topic_display = top_topic.upper() if len(top_topic) <= 4 else top_topic.capitalize()
+            if mood == "laugh":
+                return f"{clean_channel} has chat dying over {topic_display}"
+            if mood == "shock":
+                return f"{clean_channel} can't believe that {topic_display} play"
+            return f"{clean_channel}'s insane {topic_display} moment"
+
+    # --- Strategy 3: Pure mood fallback if zero keywords were spoken or typed ---
+    if mood == "laugh":
+        return f"{clean_channel} has chat losing it"
+    if mood == "shock":
+        return f"{clean_channel} leaves chat speechless"
+    return f"Peak cinema on {clean_channel}'s stream"
 
 
-def render_titled_clip(raw_mp4, final_mp4, srt_path, title_text):
-  """Applies a 3.2s blurred intro card with centered bold title fading into the clip + burned subtitles."""
-  wrapped = "\n".join(textwrap.wrap(title_text, width=28)[:2])
+def detect_webcam_box(mp4_path):
+  """Downscales 7 sampled frames to 640x360 for fast Haar Cascade webcam detection."""
+  cap = cv2.VideoCapture(mp4_path)
+  if not cap.isOpened():
+    return None
+
+  total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+  vid_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+  vid_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+  if total_frames < 10 or vid_w == 0 or vid_h == 0:
+    cap.release()
+    return None
+
+  det_w, det_h = 640, 360
+  sx, sy = vid_w / det_w, vid_h / det_h
+  detections = []
+
+  for ratio in (0.1, 0.2, 0.35, 0.5, 0.65, 0.8, 0.9):
+    cap.set(cv2.CAP_PROP_POS_FRAMES, int(total_frames * ratio))
+    ok, frame = cap.read()
+    if not ok:
+      continue
+    small_gray = cv2.cvtColor(
+        cv2.resize(frame, (det_w, det_h)), cv2.COLOR_BGR2GRAY
+    )
+    faces = FACE_CASCADE.detectMultiScale(
+        small_gray,
+        scaleFactor=1.15,
+        minNeighbors=6,
+        minSize=(int(det_w * 0.03), int(det_h * 0.05)),
+        maxSize=(int(det_w * 0.22), int(det_h * 0.38)),
+    )
+    for fx, fy, fw, fh in faces:
+      cx, cy = fx + fw / 2.0, fy + fh / 2.0
+      if not (
+          (0.36 * det_w < cx < 0.64 * det_w)
+          and (0.32 * det_h < cy < 0.68 * det_h)
+      ):
+        detections.append((fx * sx, fy * sy, fw * sx, fh * sy))
+
+  cap.release()
+  if len(detections) < 3:
+    return None
+
+  med_fx = statistics.median([d[0] for d in detections])
+  med_fy = statistics.median([d[1] for d in detections])
+  med_fw = statistics.median([d[2] for d in detections])
+  med_fh = statistics.median([d[3] for d in detections])
+
+  cam_w = int(min(vid_w * 0.34, max(vid_w * 0.16, med_fw * 3.0)))
+  cam_h = int(cam_w * 9 / 16)
+  cam_x = int(max(0, min(vid_w - cam_w, (med_fx + med_fw / 2.0) - cam_w / 2.0)))
+  cam_y = int(max(0, min(vid_h - cam_h, (med_fy + med_fh / 2.0) - cam_h * 0.45)))
+
+  # Snap cleanly to outer edges if within 3% margin
+  if cam_x < vid_w * 0.03:
+    cam_x = 0
+  elif vid_w - (cam_x + cam_w) < vid_w * 0.03:
+    cam_x = vid_w - cam_w
+  if cam_y < vid_h * 0.03:
+    cam_y = 0
+  elif vid_h - (cam_y + cam_h) < vid_h * 0.03:
+    cam_y = vid_h - cam_h
+
+  return (cam_x, cam_y, cam_w - (cam_w % 2), cam_h - (cam_h % 2))
+
+
+def render_vertical_clip(raw_mp4, final_mp4, ass_path, title_text, cam_box=None):
+  """Renders 1080x1920 (9:16) clip: Gameplay TOP + Webcam BOTTOM + 3.2s blurred hook title + ASS captions."""
+  wrapped = "\n".join(textwrap.wrap(title_text.upper(), width=22)[:2])
   escaped_title = (
       wrapped.replace("\\", "\\\\")
       .replace(":", "\\:")
       .replace("'", "\\'")
       .replace("%", "\\%")
   )
-
-  srt_escaped = srt_path.replace("\\", "/").replace(":", "\\:")
+  ass_escaped = ass_path.replace("\\", "/").replace(":", "\\:")
   sub_filter = (
-      f",subtitles='{srt_escaped}':force_style='FontName=Liberation"
-      " Sans,FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H80000000,BorderStyle=1,Outline=2,Shadow=1,MarginV=36'"
+      f",ass='{ass_escaped}'"
       if BURN_SUBTITLES
-      and os.path.exists(srt_path)
-      and os.path.getsize(srt_path) > 0
+      and os.path.exists(ass_path)
+      and os.path.getsize(ass_path) > 0
       else ""
   )
 
+  if cam_box:
+    cx, cy, cw, ch = cam_box
+    layout_graph = (
+        "[0:v]split=2[game_src][cam_src];"
+        "[game_src]scale=-2:1280,crop=1080:1280[top_game];"
+        f"[cam_src]crop={cw}:{ch}:{cx}:{cy},scale=1080:640:force_original_aspect_ratio=increase,"
+        "crop=1080:640[bot_cam];"
+        "[top_game][bot_cam]vstack=inputs=2,split=2[base][blursrc];"
+    )
+  else:
+    layout_graph = (
+        "[0:v]split=2[bg_raw][fg_raw];"
+        "[bg_raw]scale=1080:1920:force_original_aspect_ratio=increase,"
+        "crop=1080:1920,gblur=sigma=40,eq=brightness=-0.15[bg];"
+        "[fg_raw]scale=1080:-2[fg];"
+        "[bg][fg]overlay=0:(H-h)/2,split=2[base][blursrc];"
+    )
+
   filter_complex = (
-      "[0:v]split=2[base][blursrc];"
+      f"{layout_graph}"
       "[blursrc]trim=0:3.2,setpts=PTS-STARTPTS,"
-      "gblur=sigma=35,eq=brightness=-0.12,"
+      "gblur=sigma=35,eq=brightness=-0.15,"
       f"drawtext=fontfile='{FONT_PATH}':text='{escaped_title}':"
-      "fontcolor=white:fontsize=64:borderw=4:bordercolor=black:"
-      "x=(w-text_w)/2:y=(h-text_h)/2:line_spacing=14,"
+      "fontcolor=white:fontsize=62:borderw=5:bordercolor=black:"
+      "x=(w-text_w)/2:y=(h-text_h)/2:line_spacing=16,"
       "format=yuva420p,"
       "fade=t=out:st=2.3:d=0.9:alpha=1[intro];"
       f"[base][intro]overlay=0:0:eof_action=pass{sub_filter}[vout]"
   )
 
-  nvenc_cmd = [
-      "ffmpeg",
-      "-y",
-      "-hide_banner",
-      "-loglevel",
-      "error",
-      "-i",
-      raw_mp4,
-      "-filter_complex",
-      filter_complex,
-      "-map",
-      "[vout]",
-      "-map",
-      "0:a?",
-      "-c:v",
-      "h264_nvenc",
-      "-preset",
-      "p4",
-      "-cq",
-      "22",
-      "-c:a",
-      "copy",
-      final_mp4,
-  ]
-  res = subprocess.run(nvenc_cmd, check=False)
-  if res.returncode != 0:
-    cpu_cmd = [
+  encoders = (
+      ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "22"],
+      ["-c:v", "libx264", "-preset", "veryfast", "-crf", "22"],
+  )
+  for vcodec_args in encoders:
+    cmd = [
         "ffmpeg",
         "-y",
         "-hide_banner",
@@ -260,17 +478,13 @@ def render_titled_clip(raw_mp4, final_mp4, srt_path, title_text):
         "[vout]",
         "-map",
         "0:a?",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "22",
+        *vcodec_args,
         "-c:a",
         "copy",
         final_mp4,
     ]
-    subprocess.run(cpu_cmd, check=False)
+    if subprocess.run(cmd, check=False).returncode == 0:
+      break
 
 
 class StreamWatcher:
@@ -346,8 +560,7 @@ class StreamWatcher:
       shutil.rmtree(self.buffer_dir, ignore_errors=True)
       os.makedirs(self.buffer_dir, exist_ok=True)
       print(
-          f"[{self.channel}][BUFFER] Offline or disconnected. Retrying in"
-          " 30s..."
+          f"[{self.channel}][BUFFER] Offline or disconnected. Retrying in 30s..."
       )
       time.sleep(30)
 
@@ -393,7 +606,7 @@ class StreamWatcher:
     msgs_60s = sum(1 for ts, _, _ in events if (now - ts) <= 60.0)
     chat_confidence = min(1.0, msgs_60s / 30.0)
     if msgs_60s < 2:
-      return 0.0, 0.0, 0, 0.0
+      return 0.0, 0, 0.0
 
     buckets = [0.0] * 24
     raw_recent = 0
@@ -408,20 +621,19 @@ class StreamWatcher:
     current = buckets[0]
     baseline = buckets[1:]
     mean = statistics.mean(baseline) if baseline else 0.0
-
     if current < max(2.0, mean * 1.6):
-      return 0.0, 0.0, raw_recent, chat_confidence
+      return 0.0, raw_recent, chat_confidence
 
     stdev = max(statistics.stdev(baseline) if len(baseline) > 1 else 0.5, 0.35)
     z_score = (current - mean) / stdev
     if z_score < 1.2:
-      return 0.0, z_score, raw_recent, chat_confidence
+      return 0.0, raw_recent, chat_confidence
 
-    max_chat_pts = 50.0 * chat_confidence
-    raw_ratio = min(1.0, (z_score - 1.0) / 3.0)
-    return max_chat_pts * raw_ratio, z_score, raw_recent, chat_confidence
+    score = (50.0 * chat_confidence) * min(1.0, (z_score - 1.0) / 3.0)
+    return score, raw_recent, chat_confidence
 
-  def analyze_segment_signals(self, seg_path, chat_confidence):
+  def analyze_segment_signals(self, seg_path, chat_confidence, pre_score):
+    """Evaluates audio & bitrate spikes, only invoking GPU Whisper if speech points can reach threshold."""
     size_kb = os.path.getsize(seg_path) / 1024.0
     with self.lock:
       avg_kb = (
@@ -480,28 +692,24 @@ class StreamWatcher:
         else 0.0
     )
 
+    # Gate GPU Whisper: skip transcription if max_speech cannot push total_score over threshold
     transcript = ""
     speech_score = 0.0
-    try:
-      with gpu_lock:
-        segments, _ = whisper_model.transcribe(
-            seg_path, beam_size=1, vad_filter=True
-        )
-        transcript = " ".join(s.text.strip() for s in segments).strip()
-      if transcript and SPEECH_HYPE_PATTERN.search(transcript):
-        speech_score = max_speech
-    except Exception as e:
-      print(f"[{self.channel}][WHISPER] Error: {e}")
+    if (pre_score + audio_score + action_score + max_speech) >= (
+        self.dynamic_threshold - 2.0
+    ):
+      try:
+        with gpu_lock:
+          segments, _ = whisper_model.transcribe(
+              seg_path, beam_size=1, vad_filter=True
+          )
+          transcript = " ".join(s.text.strip() for s in segments).strip()
+        if transcript and SPEECH_HYPE_PATTERN.search(transcript):
+          speech_score = max_speech
+      except Exception as e:
+        print(f"[{self.channel}][WHISPER] Error: {e}")
 
-    return (
-        audio_score,
-        speech_score,
-        action_score,
-        transcript,
-        mean_db,
-        db_jump,
-        audio_z,
-    )
+    return audio_score, speech_score, action_score, transcript, db_jump
 
   def auto_tune_threshold(self, now):
     if now - self.last_tune_time < 300:
@@ -535,31 +743,10 @@ class StreamWatcher:
     if CLIP_POST_SECONDS > 0:
       time.sleep(CLIP_POST_SECONDS)
 
-    if not os.path.exists(self.buffer_dir):
-      return
-
-    # Exclude the active segment currently being written by ffmpeg
-    all_segments = sorted(
-        [
-            os.path.join(self.buffer_dir, f)
-            for f in os.listdir(self.buffer_dir)
-            if f.endswith(".ts")
-        ],
-        key=os.path.getmtime,
-    )
-    completed_segments = (
-        all_segments[:-1] if len(all_segments) > 1 else all_segments
-    )
-
-    needed = max(
-        1, (CLIP_PRE_SECONDS + CLIP_POST_SECONDS) // SEGMENT_TIME
-    )  # 30 // 4 = 7 segments (~28-32s)
-    selected = (
-        completed_segments[-needed:]
-        if len(completed_segments) >= needed
-        else completed_segments
-    )
-
+    all_segments = get_sorted_segments(self.buffer_dir)
+    completed = all_segments[:-1] if len(all_segments) > 1 else all_segments
+    needed = max(1, (CLIP_PRE_SECONDS + CLIP_POST_SECONDS) // SEGMENT_TIME)
+    selected = completed[-needed:] if len(completed) >= needed else completed
     if len(selected) < 2:
       return
 
@@ -573,7 +760,7 @@ class StreamWatcher:
     )
     raw_mp4 = os.path.join(self.buffer_dir, f"{base_name}_raw.mp4")
     final_mp4 = os.path.join(CLIPS_DIR, f"{base_name}.mp4")
-    srt_path = os.path.join(CLIPS_DIR, f"{base_name}.srt")
+    ass_path = os.path.join(CLIPS_DIR, f"{base_name}.ass")
     json_path = os.path.join(CLIPS_DIR, f"{base_name}.json")
 
     subprocess.run(
@@ -596,20 +783,32 @@ class StreamWatcher:
     )
     if os.path.exists(concat_path):
       os.remove(concat_path)
-
     if not os.path.exists(raw_mp4):
       return
 
-    full_transcript = transcribe_full_clip(raw_mp4, srt_path)
-    hook_title = generate_hook_title(self.channel, full_transcript, recent_msgs)
+    cam_box = detect_webcam_box(raw_mp4)
+    layout_mode = "SPLIT-GAME-TOP-CAM-BOTTOM" if cam_box else "BLUR-CENTERED"
+    metadata["layout_mode"] = layout_mode
+    if cam_box:
+      metadata["webcam_box"] = list(cam_box)
+
+    full_transcript = transcribe_and_build_punchy_ass(
+        raw_mp4, ass_path, has_webcam=bool(cam_box)
+    )
+    hook_title = generate_dynamic_title(self.channel, full_transcript, recent_msgs)
+    social_meta = build_social_metadata(
+        self.channel, hook_title, full_transcript
+    )
+
     metadata["generated_title"] = hook_title
     metadata["full_transcript"] = full_transcript
+    metadata["hashtags"] = social_meta["hashtags"]
 
     print(
-        f"[{self.channel}][RENDER] Rendering title '{hook_title}' +"
-        " subtitles..."
+        f"[{self.channel}][RENDER][{layout_mode}] Rendering 9:16"
+        f" '{hook_title}'..."
     )
-    render_titled_clip(raw_mp4, final_mp4, srt_path, hook_title)
+    render_vertical_clip(raw_mp4, final_mp4, ass_path, hook_title, cam_box=cam_box)
 
     if os.path.exists(raw_mp4):
       os.remove(raw_mp4)
@@ -618,48 +817,30 @@ class StreamWatcher:
       json.dump(metadata, f, indent=2)
 
     print(
-        f"[{self.channel}][SAVED CLIP] {final_mp4} | Title: \"{hook_title}\""
+        f"[{self.channel}][SAVED CLIP] {final_mp4} | Title: \"{hook_title}\" |"
+        f" Tags: {' '.join(social_meta['hashtags'])}"
     )
+    uploader.enqueue(final_mp4, social_meta)
 
   def monitor_segments(self):
     processed = set()
     while True:
       try:
-        if not os.path.exists(self.buffer_dir):
-          time.sleep(1)
-          continue
-
-        files = sorted(
-            [f for f in os.listdir(self.buffer_dir) if f.endswith(".ts")],
-            key=lambda x: os.path.getmtime(os.path.join(self.buffer_dir, x)),
-        )
+        files = get_sorted_segments(self.buffer_dir)
         completed = files[:-1] if len(files) > 1 else []
-        latest_completed = completed[-1:] if completed else []
-
-        for fname in latest_completed:
+        for seg_path in completed[-1:]:
+          fname = os.path.basename(seg_path)
           if fname in processed:
             continue
           processed.add(fname)
           if len(processed) > 200:
-            processed = set(completed[-50:])
-
-          seg_path = os.path.join(self.buffer_dir, fname)
-          if not os.path.exists(seg_path):
-            continue
+            processed = {os.path.basename(p) for p in completed[-50:]}
 
           now = time.time()
-          chat_score, z_score, raw_msgs, chat_confidence = (
-              self.compute_chat_score(now)
+          chat_score, raw_msgs, chat_confidence = self.compute_chat_score(now)
+          audio_score, speech_score, action_score, transcript, db_jump = (
+              self.analyze_segment_signals(seg_path, chat_confidence, chat_score)
           )
-          (
-              audio_score,
-              speech_score,
-              action_score,
-              transcript,
-              mean_db,
-              db_jump,
-              audio_z,
-          ) = self.analyze_segment_signals(seg_path, chat_confidence)
           total_score = chat_score + audio_score + speech_score + action_score
 
           self.recent_scores.append(total_score)
@@ -671,7 +852,8 @@ class StreamWatcher:
               f" Score={total_score:.1f}/{self.dynamic_threshold:.1f} |"
               f" Chat={chat_score:.1f} ({raw_msgs}/5s) |"
               f" Audio={audio_score:.1f} (+{db_jump:.1f}dB) |"
-              f' Speech={speech_score:.0f} | "{transcript}"'
+              f" Speech={speech_score:.0f}"
+              + (f' | "{transcript}"' if transcript else "")
           )
 
           if (
@@ -686,7 +868,6 @@ class StreamWatcher:
                 "timestamp": ts_str,
                 "stream_url": self.stream_url,
                 "mode": mode_tag,
-                "chat_confidence": round(chat_confidence, 2),
                 "total_score": round(total_score, 1),
                 "threshold_at_trigger": round(self.dynamic_threshold, 1),
                 "chat_score": round(chat_score, 1),
@@ -694,13 +875,9 @@ class StreamWatcher:
                 "speech_score": speech_score,
                 "action_score": round(action_score, 1),
                 "trigger_transcript": transcript,
-                "summary": (
-                    f"{mode_tag} chat:{chat_score:.0f} audio:{audio_score:.0f}"
-                    f" speech:{speech_score:.0f} action:{action_score:.0f}"
-                ),
             }
             print(
-                f"[{self.channel}][TRIGGER] Capturing ~30s clip"
+                f"[{self.channel}][TRIGGER] Capturing ~30s 9:16 clip"
                 f" ({total_score:.1f})..."
             )
             threading.Thread(
