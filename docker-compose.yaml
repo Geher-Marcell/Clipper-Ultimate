@@ -10,18 +10,22 @@ services:
             - SCORE_THRESHOLD=65
             - WHISPER_MODEL=base.en
             - CLIP_PRE_SECONDS=30
-            - CLIP_POST_SECONDS=10
+            - CLIP_POST_SECONDS=0
             - BURN_SUBTITLES=true
-            # Auto-Upload Settings
-            - ENABLE_UPLOAD=false
+            # Folder Auto-Upload Settings (watches /app/data/upload)
+            - ENABLE_UPLOAD=true
             - UPLOAD_TIKTOK=true
             - UPLOAD_YOUTUBE=true
             - UPLOAD_INSTAGRAM=true
+            - YT_PRIVACY=public
+            - UPLOAD_MIN_MINUTES=25
+            - UPLOAD_MAX_MINUTES=35
             - MIN_UPLOAD_INTERVAL_SEC=1800
             - IG_USERNAME=
             - IG_PASSWORD=
         volumes:
             - ./data/clips:/app/data/clips
+            - ./data/upload:/app/data/upload
             - ./data/auth:/app/data/auth
         tmpfs:
             - /app/data/buffer:size=2G

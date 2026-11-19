@@ -820,6 +820,7 @@ class StreamWatcher:
         f"[{self.channel}][SAVED CLIP] {final_mp4} | Title: \"{hook_title}\" |"
         f" Tags: {' '.join(social_meta['hashtags'])}"
     )
+    # Approved clips are moved to data/upload/ via review_clips.py
     uploader.enqueue(final_mp4, social_meta)
 
   def monitor_segments(self):
