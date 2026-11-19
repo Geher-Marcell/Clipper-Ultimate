@@ -44,7 +44,8 @@ CHAT_HYPE_PATTERN = re.compile(
     r"(?:"
     r"\b(?:cooked|cinema|cinematic|ts|pmo|sybau|icl|ong|fr+|nah+|bro+|aura|unc|glaz(?:e|ing)|"
     r"type\s*shit|lock\s*in|peak|motion|valid|joever|icant|aware|pause|ayoo+|holyy+|yooo+|nooo+|"
-    r"clipped?|w{3,}|l{3,}|kekw|omegalul|lulw?|pog+|poggers|omg|wtf|insane|crazy)\b"
+    r"clipped?|w{3,}|l{3,}|kekw|omegalul|lulw?|pog+|poggers|pagman|monkaw|catdespair|omg|wtf|"
+    r"insane|crazy|gold+|knife|vac|vas|naur+|clutch|gg|ez)\b"
     r"|"
     r"\b(?:ain'?t\s+no\s+way|no\s+way|hell\s+nah|we\s+are\s+so\s+back|it'?s\s+over|"
     r"chat\s+is\s+this\s+real|absolute\s+cinema|what\s+the\s+helly?)\b"
@@ -414,12 +415,11 @@ def detect_webcam_box(mp4_path):
 def render_vertical_clip(raw_mp4, final_mp4, ass_path, title_text, cam_box=None):
   """Renders 1080x1920 (9:16) clip: Gameplay TOP + Webcam BOTTOM + 3.2s blurred hook title + ASS captions."""
   wrapped = "\n".join(textwrap.wrap(title_text.upper(), width=22)[:2])
-  escaped_title = (
-      wrapped.replace("\\", "\\\\")
-      .replace(":", "\\:")
-      .replace("'", "\\'")
-      .replace("%", "\\%")
-  )
+  intro_txt_path = f"{os.path.splitext(str(final_mp4))[0]}_intro.txt"
+  with open(intro_txt_path, "w", encoding="utf-8") as f:
+    f.write(wrapped)
+
+  intro_txt_escaped = intro_txt_path.replace("\\", "/").replace(":", "\\:")
   ass_escaped = ass_path.replace("\\", "/").replace(":", "\\:")
   sub_filter = (
       f",ass='{ass_escaped}'"
@@ -451,7 +451,7 @@ def render_vertical_clip(raw_mp4, final_mp4, ass_path, title_text, cam_box=None)
       f"{layout_graph}"
       "[blursrc]trim=0:3.2,setpts=PTS-STARTPTS,"
       "gblur=sigma=35,eq=brightness=-0.15,"
-      f"drawtext=fontfile='{FONT_PATH}':text='{escaped_title}':"
+      f"drawtext=fontfile='{FONT_PATH}':textfile='{intro_txt_escaped}':"
       "fontcolor=white:fontsize=62:borderw=5:bordercolor=black:"
       "x=(w-text_w)/2:y=(h-text_h)/2:line_spacing=16,"
       "format=yuva420p,"
@@ -463,28 +463,32 @@ def render_vertical_clip(raw_mp4, final_mp4, ass_path, title_text, cam_box=None)
       ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "22"],
       ["-c:v", "libx264", "-preset", "veryfast", "-crf", "22"],
   )
-  for vcodec_args in encoders:
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-i",
-        raw_mp4,
-        "-filter_complex",
-        filter_complex,
-        "-map",
-        "[vout]",
-        "-map",
-        "0:a?",
-        *vcodec_args,
-        "-c:a",
-        "copy",
-        final_mp4,
-    ]
-    if subprocess.run(cmd, check=False).returncode == 0:
-      break
+  try:
+    for vcodec_args in encoders:
+      cmd = [
+          "ffmpeg",
+          "-y",
+          "-hide_banner",
+          "-loglevel",
+          "error",
+          "-i",
+          raw_mp4,
+          "-filter_complex",
+          filter_complex,
+          "-map",
+          "[vout]",
+          "-map",
+          "0:a?",
+          *vcodec_args,
+          "-c:a",
+          "copy",
+          final_mp4,
+      ]
+      if subprocess.run(cmd, check=False).returncode == 0:
+        break
+  finally:
+    if os.path.exists(intro_txt_path):
+      os.remove(intro_txt_path)
 
 
 class StreamWatcher:
@@ -604,32 +608,46 @@ class StreamWatcher:
       events = list(self.chat_events)
 
     msgs_60s = sum(1 for ts, _, _ in events if (now - ts) <= 60.0)
-    chat_confidence = min(1.0, msgs_60s / 30.0)
+    chat_confidence = min(1.0, msgs_60s / 25.0)
     if msgs_60s < 2:
       return 0.0, 0, 0.0
 
     buckets = [0.0] * 24
     raw_recent = 0
-    for ts, weight, _ in events:
+    hype_recent = 0
+    for ts, weight, msg_text in events:
       age = now - ts
       if age <= 5.0:
         raw_recent += 1
+        if weight > 1.0 or (len(msg_text.strip()) >= 3 and msg_text.strip().isupper()):
+          hype_recent += 1
       idx = int(age // 5)
       if 0 <= idx < 24:
         buckets[idx] += weight
 
     current = buckets[0]
-    baseline = buckets[1:]
+    if raw_recent < 2:
+      return 0.0, raw_recent, chat_confidence
+
+    baseline = sorted(buckets[1:])[:-3]
     mean = statistics.mean(baseline) if baseline else 0.0
-    if current < max(2.0, mean * 1.6):
-      return 0.0, raw_recent, chat_confidence
+    stdev = max(statistics.stdev(baseline) if len(baseline) > 1 else 1.0, 0.75)
 
-    stdev = max(statistics.stdev(baseline) if len(baseline) > 1 else 0.5, 0.35)
     z_score = (current - mean) / stdev
-    if z_score < 1.2:
+    ratio = current / max(mean, 1.0)
+    hype_density = hype_recent / max(1, raw_recent)
+
+    # Trigger on a message-rate surge OR when >= 40% of active chat is hype emotes/caps
+    if z_score < 0.8 and ratio < 1.25 and hype_density < 0.40:
       return 0.0, raw_recent, chat_confidence
 
-    score = (50.0 * chat_confidence) * min(1.0, (z_score - 1.0) / 3.0)
+    z_component = min(1.0, max(0.0, (z_score - 0.6) / 3.2))
+    emote_surge = min(1.0, max(0.0, (hype_density - 0.30) / 0.45))
+    velocity_bonus = min(0.25, raw_recent / 120.0)
+
+    base_signal = max(z_component, emote_surge * 0.85)
+    strength = min(1.0, (base_signal * 0.75) + (hype_density * 0.25) + velocity_bonus)
+    score = (50.0 * chat_confidence) * strength
     return score, raw_recent, chat_confidence
 
   def analyze_segment_signals(self, seg_path, chat_confidence, pre_score):
@@ -796,9 +814,11 @@ class StreamWatcher:
         raw_mp4, ass_path, has_webcam=bool(cam_box)
     )
     hook_title = generate_dynamic_title(self.channel, full_transcript, recent_msgs)
-    social_meta = build_social_metadata(
-        self.channel, hook_title, full_transcript
-    )
+    social_meta = build_social_metadata({
+        "channel": self.channel,
+        "title": hook_title,
+        "transcript": full_transcript,
+    })
 
     metadata["generated_title"] = hook_title
     metadata["full_transcript"] = full_transcript

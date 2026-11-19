@@ -3,11 +3,15 @@ services:
         build: .
         container_name: my-live-clipper
         restart: unless-stopped
+        shm_size: "1gb"
+        dns:
+            - 8.8.8.8
+            - 1.1.1.1
         security_opt:
             - no-new-privileges:true
         environment:
             - STREAM_URLS=https://www.twitch.tv/typicalgamer,https://www.twitch.tv/ishowspeed,https://www.twitch.tv/kaicenat,https://www.twitch.tv/ohnepixel,https://www.twitch.tv/xqc,https://www.twitch.tv/nickeh30
-            - SCORE_THRESHOLD=65
+            - SCORE_THRESHOLD=70
             - WHISPER_MODEL=base.en
             - CLIP_PRE_SECONDS=30
             - CLIP_POST_SECONDS=0
@@ -21,8 +25,6 @@ services:
             - UPLOAD_MIN_MINUTES=25
             - UPLOAD_MAX_MINUTES=35
             - MIN_UPLOAD_INTERVAL_SEC=1800
-            - IG_USERNAME=
-            - IG_PASSWORD=
         volumes:
             - ./data/clips:/app/data/clips
             - ./data/upload:/app/data/upload
